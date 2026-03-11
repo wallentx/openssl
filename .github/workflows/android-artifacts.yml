@@ -1,0 +1,199 @@
+# Copyright 2021-2026 The OpenSSL Project Authors. All Rights Reserved.
+#
+# Licensed under the Apache License 2.0 (the "License").  You may not use
+# this file except in compliance with the License.  You can obtain a copy
+# in the file LICENSE in the source distribution or at
+# https://www.openssl.org/source/license.html
+
+name: Android Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit SHA to build (code only; keeps .github from dispatched ref)
+        required: false
+        type: string
+        default: ""
+      build_target:
+        description: Target to build
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - android-arm
+          - android-arm64
+          - android-x86
+          - android-x86_64
+          - android-riscv64
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_NDK_VERSION: 27.2.12479018
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Select build matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.build_target }}" in
+            all)
+              matrix='[
+                {"target":"android-arm","abi":"armeabi-v7a"},
+                {"target":"android-arm64","abi":"arm64-v8a"},
+                {"target":"android-x86","abi":"x86"},
+                {"target":"android-x86_64","abi":"x86_64"},
+                {"target":"android-riscv64","abi":"riscv64"}
+              ]'
+              ;;
+            android-arm)
+              matrix='[{"target":"android-arm","abi":"armeabi-v7a"}]'
+              ;;
+            android-arm64)
+              matrix='[{"target":"android-arm64","abi":"arm64-v8a"}]'
+              ;;
+            android-x86)
+              matrix='[{"target":"android-x86","abi":"x86"}]'
+              ;;
+            android-x86_64)
+              matrix='[{"target":"android-x86_64","abi":"x86_64"}]'
+              ;;
+            android-riscv64)
+              matrix='[{"target":"android-riscv64","abi":"riscv64"}]'
+              ;;
+          esac
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  build-android:
+    needs: prepare
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v6
+        if: inputs.source_ref != ''
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: __source_ref__
+          persist-credentials: false
+
+      - name: Record build source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.source_ref }}" ]; then
+            echo "BUILD_SOURCE_REF=${{ inputs.source_ref }}" >> "$GITHUB_ENV"
+            echo "BUILD_SOURCE_SHA=$(git -C __source_ref__ rev-parse HEAD)" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_SOURCE_REF=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+            echo "BUILD_SOURCE_SHA=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Replace source tree with requested ref
+        if: inputs.source_ref != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name .git \
+            ! -name .github \
+            ! -name __source_ref__ \
+            -exec rm -rf {} +
+          tar -C __source_ref__ \
+            --exclude=.git \
+            --exclude=.github \
+            -cf - . | tar -xf -
+          rm -rf __source_ref__
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Configure Android toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          [ -n "${sdk_root}" ]
+          ndk_root="${sdk_root}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_SDK_ROOT=${sdk_root}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=${ndk_root}" >> "$GITHUB_ENV"
+          echo "${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./Configure \
+            --banner=Configured \
+            --strict-warnings \
+            shared \
+            no-tests \
+            enable-lms \
+            --prefix=/opt/openssl-android/${{ matrix.abi }} \
+            --openssldir=/opt/openssl-android/${{ matrix.abi }}/ssl \
+            ${{ matrix.target }}
+          ./configdata.pm --dump
+
+      - name: Build
+        run: make -s -j"$(nproc)"
+
+      - name: Stage install tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_name="openssl-android-${{ matrix.target }}"
+          artifact_root="$PWD/artifacts/${artifact_name}"
+          install_root="$PWD/_install"
+
+          make DESTDIR="${install_root}" install_sw install_ssldirs
+
+          mkdir -p "${artifact_root}"
+          mv "${install_root}/opt" "${artifact_root}/"
+          ./configdata.pm --dump > "${artifact_root}/configdata.txt"
+          printf '%s\n' \
+            "target=${{ matrix.target }}" \
+            "abi=${{ matrix.abi }}" \
+            "source_ref=${BUILD_SOURCE_REF}" \
+            "source_sha=${BUILD_SOURCE_SHA}" \
+            "workflow_ref=${GITHUB_REF}" \
+            "workflow_sha=${GITHUB_SHA}" \
+            "ndk_version=${ANDROID_NDK_VERSION}" \
+            > "${artifact_root}/build-info.txt"
+          tar -C "$PWD/artifacts" -czf "${artifact_name}.tar.gz" "${artifact_name}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-artifacts@${{ matrix.target }}
+          path: openssl-android-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
